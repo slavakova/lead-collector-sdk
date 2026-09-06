@@ -25,8 +25,12 @@
         name: ['name', 'fullname', 'full_name', 'full name', 'fio', 'your-name'],
         phone: ['phone', 'tel', 'telephone', 'phone_number', 'your-phone'],
         email: ['email', 'mail', 'your-email'],
-        message: ['message', 'comment', 'question', 'textarea', 'your-message'],
+        message: ['message', 'comment', 'question', 'textarea', 'your-message', 'task', 'description', 'details', 'problem'],
+        address: ['address', 'addr', 'street', 'location', 'delivery_address', 'your-address'],
+        company: ['company', 'organization', 'organisation', 'company_name'],
+        service: ['service', 'service_type', 'work_type', 'category'],
     };
+    var CONSENT_ALIASES = ['consent', 'agreement', 'privacy', 'personal_data', 'policy'];
     var SENSITIVE_FIELD = /(password|passcode|card|credit|debit|cvv|cvc|payment|passport|csrf|nonce|token|auth)/i;
     var DEFAULT_SUCCESS_SELECTORS = [
         '.wpcf7-mail-sent-ok', '.elementor-message-success', '.w-form-done',
@@ -59,6 +63,7 @@
     function normalizeRules(value) {
         var rules = value && typeof value === 'object' ? value : {};
         var aliases = rules.fieldAliases && typeof rules.fieldAliases === 'object' ? rules.fieldAliases : {};
+        var extraAliases = rules.extraFieldAliases && typeof rules.extraFieldAliases === 'object' ? rules.extraFieldAliases : {};
         return {
             platformHint: text(rules.platformHint),
             successSelectors: stringList(rules.successSelectors),
@@ -68,6 +73,10 @@
             fieldAliases: {
                 name: stringList(aliases.name), phone: stringList(aliases.phone),
                 email: stringList(aliases.email), message: stringList(aliases.message),
+            },
+            extraFieldAliases: {
+                address: stringList(extraAliases.address), company: stringList(extraAliases.company),
+                service: stringList(extraAliases.service), message: stringList(extraAliases.message),
             },
         };
     }
@@ -187,9 +196,12 @@
             source_lead_id: sourceId(input) || generatedAttemptId(input),
             created_at: text(input.createdAt) || new Date().toISOString(),
             name: text(input.name), phone: text(input.phone), email: text(input.email), message: text(input.message),
+            address: text(input.address), company: text(input.company), service: text(input.service),
             page_url: text(input.pageUrl) || (global.location && global.location.href),
+            page_title: text(input.pageTitle) || text(document && document.title),
             referrer: text(input.referrer) || (document && document.referrer),
             client_id: text(input.clientId) || resolvedClientId, yclid: text(input.yclid) || queryValue('yclid'),
+            consent: typeof input.consent === 'boolean' ? input.consent : undefined,
         };
         UTM_FIELDS.forEach(function (field) {
             payload[field] = text((input.utm || {})[field]) || text(input[field]) || queryValue(field);
@@ -253,7 +265,11 @@
     }
 
     function aliasesFor(kind) {
-        return FIELD_ALIASES[kind].concat(config && config.rules ? config.rules.fieldAliases[kind] : []);
+        var standard = FIELD_ALIASES[kind] || [];
+        var rules = config && config.rules;
+        var configured = rules && rules.fieldAliases[kind] ? rules.fieldAliases[kind] : [];
+        var extra = rules && rules.extraFieldAliases[kind] ? rules.extraFieldAliases[kind] : [];
+        return standard.concat(configured, extra);
     }
 
     function descriptorTokens(value) {
@@ -276,13 +292,28 @@
     }
 
     function kindFromTokens(tokens, kinds) {
-        return kinds.find(function (kind) {
-            return aliasesFor(kind).some(function (alias) { return aliasMatches(tokens, alias); });
-        }) || null;
+        var best = null;
+        kinds.forEach(function (kind) {
+            aliasesFor(kind).forEach(function (alias) {
+                var aliasTokens = descriptorTokens(alias);
+                if (!aliasMatches(tokens, alias)) { return; }
+                if (!best || aliasTokens.length > best.length) {
+                    best = { kind: kind, length: aliasTokens.length };
+                }
+            });
+        });
+        return best ? best.kind : null;
+    }
+
+    function isConsentCheckbox(element, identity, presentation) {
+        if ((text(element && element.type) || '').toLowerCase() !== 'checkbox') { return false; }
+        var tokens = identity.concat(presentation);
+        return CONSENT_ALIASES.some(function (alias) { return aliasMatches(tokens, alias); });
     }
 
     function fieldKind(element) {
         var type = (text(element && element.type) || '').toLowerCase();
+        var tagName = String(element && element.tagName || '').toLowerCase();
         var autocomplete = (text(element && element.autocomplete) || '').toLowerCase();
         var identity = descriptorTokens([element && element.name, element && element.id].filter(Boolean).join(' '));
         var presentation = descriptorTokens([element && element.placeholder, labelsFor(element)].filter(Boolean).join(' '));
@@ -295,15 +326,12 @@
         }
         if (type === 'tel') { return 'phone'; }
         if (type === 'email') { return 'email'; }
-        if (type === 'textarea') { return 'message'; }
+        if (tagName === 'textarea' || type === 'textarea') { return 'message'; }
         if (['tel', 'tel-national', 'tel-local'].indexOf(autocomplete) >= 0) { return 'phone'; }
         if (autocomplete === 'email') { return 'email'; }
         if (['name', 'given-name', 'family-name', 'additional-name'].indexOf(autocomplete) >= 0) { return 'name'; }
-        if (identity.indexOf('company') >= 0 || identity.indexOf('organization') >= 0 || identity.indexOf('business') >= 0) {
-            return kindFromTokens(identity, ['phone', 'email', 'message']);
-        }
-        return kindFromTokens(identity, ['phone', 'email', 'name', 'message']) ||
-            kindFromTokens(presentation, ['phone', 'email', 'name', 'message']);
+        return kindFromTokens(identity, ['phone', 'email', 'name', 'message', 'address', 'company', 'service']) ||
+            kindFromTokens(presentation, ['phone', 'email', 'name', 'message', 'address', 'company', 'service']);
     }
 
     function extractFields(form) {
@@ -312,7 +340,16 @@
             return fields;
         }
         Array.prototype.forEach.call(form.elements, function (element) {
-            if (!element || element.disabled || (element.checked === false && /^(checkbox|radio)$/i.test(element.type || ''))) {
+            if (!element || element.disabled) {
+                return;
+            }
+            var identity = descriptorTokens([element.name, element.id].filter(Boolean).join(' '));
+            var presentation = descriptorTokens([element.placeholder, labelsFor(element)].filter(Boolean).join(' '));
+            if (isConsentCheckbox(element, identity, presentation)) {
+                fields.consent = element.checked === true;
+                return;
+            }
+            if (element.checked === false && /^(checkbox|radio)$/i.test(element.type || '')) {
                 return;
             }
             var kind = fieldKind(element);
@@ -431,6 +468,8 @@
         attempt.deliveryPromise = send({
             sourceLeadId: attempt.id, createdAt: attempt.createdAtIso, name: attempt.fields.name,
             phone: attempt.fields.phone, email: attempt.fields.email, message: attempt.fields.message,
+            address: attempt.fields.address, company: attempt.fields.company, service: attempt.fields.service,
+            consent: attempt.fields.consent,
             pageUrl: attempt.pageUrl, referrer: attempt.referrer,
         }).then(function (result) {
             attempt.deliveryPromise = null;
@@ -715,7 +754,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.1.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.2.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

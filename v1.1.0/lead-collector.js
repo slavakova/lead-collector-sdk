@@ -14,6 +14,9 @@
     var fetchInstalled = false;
     var xhrInstalled = false;
     var domObserver = null;
+    var jqueryBridgeInstalled = false;
+    var jqueryBridgeRetries = 0;
+    var jqueryBridgeRetryPending = false;
     var ATTEMPT_TTL_MS = 5 * 60 * 1000;
     var SIGNAL_WINDOW_MS = 30 * 1000;
     var REQUIRED_CONFIG = ['projectId', 'endpoint', 'publicKey'];
@@ -253,19 +256,54 @@
         return FIELD_ALIASES[kind].concat(config && config.rules ? config.rules.fieldAliases[kind] : []);
     }
 
-    function fieldKind(element) {
-        var type = text(element && element.type) || '';
-        var descriptor = [element && element.name, element && element.id, type, element && element.autocomplete,
-            element && element.placeholder, labelsFor(element)].filter(Boolean).join(' ').toLowerCase();
-        if (type.toLowerCase() === 'hidden' || SENSITIVE_FIELD.test(descriptor)) {
-            return null;
+    function descriptorTokens(value) {
+        return String(value || '')
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter(Boolean);
+    }
+
+    function aliasMatches(tokens, alias) {
+        var aliasTokens = descriptorTokens(alias);
+        if (!aliasTokens.length || aliasTokens.length > tokens.length) { return false; }
+        for (var index = 0; index <= tokens.length - aliasTokens.length; index += 1) {
+            if (aliasTokens.every(function (token, offset) { return tokens[index + offset] === token; })) {
+                return true;
+            }
         }
-        if (type.toLowerCase() === 'password' || type.toLowerCase() === 'file') {
-            return null;
-        }
-        return ['name', 'phone', 'email', 'message'].find(function (kind) {
-            return aliasesFor(kind).some(function (alias) { return descriptor.indexOf(alias.toLowerCase()) >= 0; });
+        return false;
+    }
+
+    function kindFromTokens(tokens, kinds) {
+        return kinds.find(function (kind) {
+            return aliasesFor(kind).some(function (alias) { return aliasMatches(tokens, alias); });
         }) || null;
+    }
+
+    function fieldKind(element) {
+        var type = (text(element && element.type) || '').toLowerCase();
+        var autocomplete = (text(element && element.autocomplete) || '').toLowerCase();
+        var identity = descriptorTokens([element && element.name, element && element.id].filter(Boolean).join(' '));
+        var presentation = descriptorTokens([element && element.placeholder, labelsFor(element)].filter(Boolean).join(' '));
+        var descriptor = identity.concat(descriptorTokens(type), descriptorTokens(autocomplete), presentation).join(' ');
+        if (type === 'hidden' || SENSITIVE_FIELD.test(descriptor)) {
+            return null;
+        }
+        if (type === 'password' || type === 'file') {
+            return null;
+        }
+        if (type === 'tel') { return 'phone'; }
+        if (type === 'email') { return 'email'; }
+        if (type === 'textarea') { return 'message'; }
+        if (['tel', 'tel-national', 'tel-local'].indexOf(autocomplete) >= 0) { return 'phone'; }
+        if (autocomplete === 'email') { return 'email'; }
+        if (['name', 'given-name', 'family-name', 'additional-name'].indexOf(autocomplete) >= 0) { return 'name'; }
+        if (identity.indexOf('company') >= 0 || identity.indexOf('organization') >= 0 || identity.indexOf('business') >= 0) {
+            return kindFromTokens(identity, ['phone', 'email', 'message']);
+        }
+        return kindFromTokens(identity, ['phone', 'email', 'name', 'message']) ||
+            kindFromTokens(presentation, ['phone', 'email', 'name', 'message']);
     }
 
     function extractFields(form) {
@@ -337,7 +375,8 @@
         var attempt = {
             id: randomId(), form: form, createdAt: now, createdAtIso: new Date().toISOString(), fields: fields,
             pageUrl: global.location && global.location.href, referrer: document && document.referrer,
-            action: formAction(form), method: formMethod(form), submitter: submitter || null, completed: false,
+            action: formAction(form), method: formMethod(form), submitter: submitter || null,
+            completed: false, deliveryPromise: null,
         };
         formAttempts.set(form, attempt);
         recentAttempts.push(attempt);
@@ -386,23 +425,37 @@
         if (!attempt || attempt.completed || Date.now() - attempt.createdAt > ATTEMPT_TTL_MS) {
             return Promise.resolve({ sent: false, reason: 'already_completed' });
         }
-        attempt.completed = true;
-        return send({
+        if (attempt.deliveryPromise) {
+            return attempt.deliveryPromise;
+        }
+        attempt.deliveryPromise = send({
             sourceLeadId: attempt.id, createdAt: attempt.createdAtIso, name: attempt.fields.name,
             phone: attempt.fields.phone, email: attempt.fields.email, message: attempt.fields.message,
             pageUrl: attempt.pageUrl, referrer: attempt.referrer,
         }).then(function (result) {
+            attempt.deliveryPromise = null;
+            if (result && result.sent === true) {
+                attempt.completed = true;
+            }
             debug('Lead Collector success signal:', source, result.sent ? 'sent' : result.reason);
             return result;
+        }, function () {
+            attempt.deliveryPromise = null;
+            return { sent: false, reason: 'unavailable' };
         });
+        return attempt.deliveryPromise;
     }
 
     function success(formOrPayload) {
         if (formOrPayload && typeof formOrPayload === 'object' && String(formOrPayload.tagName || '').toLowerCase() === 'form') {
+            var existing = currentAttempt(formOrPayload, false);
+            if (existing) {
+                return completedAttempt(existing, 'explicit');
+            }
             if (!isEligibleForm(formOrPayload) || !isValidForm(formOrPayload)) {
                 return Promise.resolve({ sent: false, reason: 'ignored_form' });
             }
-            return completedAttempt(currentAttempt(formOrPayload, true), 'explicit');
+            return completedAttempt(createAttempt(formOrPayload), 'explicit');
         }
         return send(formOrPayload || {});
     }
@@ -426,7 +479,9 @@
         if (!values.length) { return false; }
         try {
             if (typeof body === 'string') {
-                return values.some(function (value) { return body.indexOf(value) >= 0; });
+                var decoded = body;
+                try { decoded = decodeURIComponent(body.replace(/\+/g, '%20')); } catch (_) { /* raw body remains available */ }
+                return values.some(function (value) { return body.indexOf(value) >= 0 || decoded.indexOf(value) >= 0; });
             }
             if (typeof body.get === 'function') {
                 return values.some(function (value) {
@@ -441,13 +496,20 @@
 
     function correlatedAttempt(request) {
         var now = Date.now();
+        if (!requestMatchesRules(request.url)) { return null; }
         var candidates = recentAttempts.filter(function (attempt) {
-            return !attempt.completed && now - attempt.createdAt <= SIGNAL_WINDOW_MS && attempt.method === request.method;
-        });
-        var matches = candidates.filter(function (attempt) {
-            return requestMatchesRules(request.url) && (sameUrl(attempt.action, request.url) || bodyContainsAttempt(request.body, attempt));
-        });
-        return matches.length === 1 ? matches[0] : null;
+            return !attempt.completed && now - attempt.createdAt <= SIGNAL_WINDOW_MS;
+        }).map(function (attempt) {
+            var actionMatch = sameUrl(attempt.action, request.url);
+            var bodyMatch = bodyContainsAttempt(request.body, attempt);
+            var patternMatch = config && config.rules && config.rules.requestUrlPatterns.length > 0;
+            if (!actionMatch && !bodyMatch && !patternMatch) { return null; }
+            var score = (bodyMatch ? 8 : 0) + (actionMatch ? 6 : 0) + (patternMatch ? 3 : 0) +
+                (attempt.method === request.method ? 1 : 0);
+            return { attempt: attempt, score: score };
+        }).filter(Boolean).sort(function (left, right) { return right.score - left.score; });
+        if (!candidates.length || (candidates[1] && candidates[0].score === candidates[1].score)) { return null; }
+        return candidates[0].attempt;
     }
 
     function responseIsSuccess(response) {
@@ -533,7 +595,16 @@
 
     function attemptForSuccessElement(element) {
         var form = closest(element, 'form');
-        return form ? currentAttempt(form, false) : null;
+        if (form) { return currentAttempt(form, false); }
+        var now = Date.now();
+        var candidates = recentAttempts.filter(function (attempt) {
+            return !attempt.completed && now - attempt.createdAt <= SIGNAL_WINDOW_MS;
+        });
+        var nearby = candidates.filter(function (attempt) {
+            return attempt.form && attempt.form.parentNode && attempt.form.parentNode === element.parentNode;
+        });
+        if (nearby.length === 1) { return nearby[0]; }
+        return nearby.length === 0 && candidates.length === 1 ? candidates[0] : null;
     }
 
     function domSuccessSignal(element) {
@@ -586,15 +657,34 @@
                 if (form) { completedAttempt(currentAttempt(form, false), 'platform'); }
             });
         });
+        installJQueryElementorBridge();
+        scheduleJQueryElementorBridge();
+    }
+
+    function installJQueryElementorBridge() {
+        if (jqueryBridgeInstalled || !global.jQuery || typeof global.jQuery !== 'function') { return false; }
         try {
-            if (global.jQuery && typeof global.jQuery === 'function') {
-                global.jQuery(document).on('submit_success', function (event, _response, form) {
-                    var element = form && form[0] ? form[0] : form;
-                    var resolved = formFromEvent(event, element);
-                    if (resolved) { completedAttempt(currentAttempt(resolved, false), 'platform'); }
-                });
-            }
-        } catch (_) { /* optional Elementor jQuery bridge */ }
+            global.jQuery(document).on('submit_success', function (event, _response, form) {
+                var element = form && form[0] ? form[0] : form;
+                var resolved = formFromEvent(event, element);
+                if (resolved) { completedAttempt(currentAttempt(resolved, false), 'platform'); }
+            });
+            jqueryBridgeInstalled = true;
+            return true;
+        } catch (_) { return false; }
+    }
+
+    function scheduleJQueryElementorBridge() {
+        if (jqueryBridgeInstalled || jqueryBridgeRetryPending || jqueryBridgeRetries >= 10 || typeof global.setTimeout !== 'function') {
+            return;
+        }
+        jqueryBridgeRetryPending = true;
+        var timer = global.setTimeout(function () {
+            jqueryBridgeRetryPending = false;
+            jqueryBridgeRetries += 1;
+            if (!installJQueryElementorBridge()) { scheduleJQueryElementorBridge(); }
+        }, 500);
+        if (timer && typeof timer.unref === 'function') { timer.unref(); }
     }
 
     function installAutoCapture() {
@@ -602,7 +692,10 @@
         autoInstalled = true;
         discoverForms(document);
         if (typeof document.addEventListener === 'function') {
-            document.addEventListener('DOMContentLoaded', function () { discoverForms(document); });
+            document.addEventListener('DOMContentLoaded', function () {
+                discoverForms(document);
+                if (!installJQueryElementorBridge()) { scheduleJQueryElementorBridge(); }
+            });
         }
         installPlatformProviders();
         installFetchProvider();

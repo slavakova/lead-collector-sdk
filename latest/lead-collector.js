@@ -715,7 +715,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.1.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.1.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

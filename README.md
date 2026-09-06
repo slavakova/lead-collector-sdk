@@ -1,71 +1,54 @@
 # Lead Collector SDK release bundle
 
-This directory is a publish-ready bundle for the universal browser SDK. The
-JavaScript files are generated from
-`app/lead_collector/static/lead-collector.js`; do not edit either release copy
-by hand. Rebuild them with:
+All JavaScript files in this directory are generated from
+`app/lead_collector/static/lead-collector.js`. Do not edit a release copy by
+hand:
 
 ```powershell
 python scripts/build_lead_collector_sdk.py
 ```
 
-For a separate public repository, copy only this bundle's generated files:
+SDK version: `1.1.0`.
 
 ```text
 lead-collector-sdk/
-  lead-collector.js                 # generated current version
-  v1.0.1/lead-collector.js          # immutable release
-  latest/lead-collector.js          # optional convenience alias
+  lead-collector.js
+  v1.1.0/lead-collector.js
+  latest/lead-collector.js
   README.md
 ```
 
-The simplest public distribution is a GitHub repository with jsDelivr:
+Publish this directory alone to a small public repository. A production site
+should use an immutable URL, for example:
 
 ```text
-https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.0.1/lead-collector.js
+https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.1.0/lead-collector.js
 ```
 
-GitHub Pages is also supported:
-
-```text
-https://GITHUB_USER.github.io/lead-collector-sdk/v1.0.1/lead-collector.js
-```
-
-Use the versioned URL in production. Publishing is a manual GitHub action;
-this project does not push or publish anything automatically.
-
-## Universal installation
+## Install
 
 ```html
-<script
+<script defer
   src="STABLE_SDK_URL"
   data-project-id="PROJECT_ID"
   data-endpoint="COLLECTOR_API_URL"
-  data-public-key="PROJECT_PUBLIC_KEY">
+  data-public-key="PROJECT_PUBLIC_KEY"
+  data-auto="true">
 </script>
 ```
 
-The SDK contains no server token, OAuth credential, bot token, project public
-key, domain, or personal data. `data-public-key` is browser-public project
-configuration. `data-endpoint` is the Lead Collector API origin.
+The SDK contains no server token, OAuth credential, bot token, project key,
+endpoint hostname, or personal data. `data-public-key` and `data-endpoint` are
+site-specific browser configuration.
 
-For the current temporary smoke endpoint only:
+AutoCapture records a form attempt on submit, then delivers a lead only after
+a correlated success signal. For an uncommon host form whose success cannot
+be detected safely, add this one line to its existing confirmed callback:
 
-```html
-<script
-  src="STABLE_SDK_URL"
-  data-project-id="spilexpert"
-  data-endpoint="https://eloquent-foster-unbounded.ngrok-free.dev"
-  data-public-key="PROJECT_PUBLIC_KEY">
-</script>
+```js
+LeadCollector.success(form);
 ```
 
-The ngrok Free hostname is an API endpoint example, not an SDK hosting URL,
-and must not be treated as a production hostname.
-
-## API
-
-Call `LeadCollector.send({...})` only after the host form has confirmed
-success. The SDK does not intercept forms, `fetch`, or XHR. It fills page URL,
-referrer, UTM values, timestamp, and Metrika ClientId when available; absent
-ClientId does not block delivery. `LeadCollector.version` is `1.0.1`.
+`LeadCollector.send(payload)` remains available for existing explicit SDK
+1.0.x integrations. See `docs/LEAD_COLLECTOR.md` in the source project for
+security rules, adapters, and remote-rules design.

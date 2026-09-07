@@ -8,12 +8,12 @@ hand:
 python scripts/build_lead_collector_sdk.py
 ```
 
-SDK version: `1.2.0`.
+SDK version: `1.3.0`.
 
 ```text
 lead-collector-sdk/
   lead-collector.js
-  v1.2.0/lead-collector.js
+  v1.3.0/lead-collector.js
   latest/lead-collector.js
   README.md
 ```
@@ -22,7 +22,7 @@ Publish this directory alone to a small public repository. A production site
 should use an immutable URL, for example:
 
 ```text
-https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.2.0/lead-collector.js
+https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.3.0/lead-collector.js
 ```
 
 ## Install

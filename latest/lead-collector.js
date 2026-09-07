@@ -533,15 +533,55 @@
         return false;
     }
 
+    function isWordPressAdminAjaxRequest(request) {
+        if (!request || request.method !== 'POST') { return false; }
+        try {
+            var requestUrl = new URL(request.url, global.location && global.location.href);
+            var pageUrl = new URL(global.location && global.location.href);
+            return requestUrl.origin === pageUrl.origin && requestUrl.pathname === '/wp-admin/admin-ajax.php';
+        } catch (_) { return false; }
+    }
+
+    function requestBodyEntries(body) {
+        var entries = [];
+        try {
+            if (typeof body === 'string') {
+                new URLSearchParams(body).forEach(function (value, key) { entries.push([key, value]); });
+            } else if (body && typeof body.forEach === 'function') {
+                body.forEach(function (value, key) { entries.push([key, value]); });
+            }
+        } catch (_) { return []; }
+        return entries;
+    }
+
+    function wordpressAdminAjaxBodyMatchesAttempt(body, attempt) {
+        var entries = requestBodyEntries(body);
+        var actionPresent = entries.some(function (entry) {
+            return entry[0] === 'action' && text(entry[1]);
+        });
+        if (!actionPresent || !attempt || !attempt.fields) { return false; }
+        return entries.some(function (entry) {
+            var kind = kindFromTokens(descriptorTokens(entry[0]), ['phone', 'email', 'name', 'message', 'service']);
+            var value = text(entry[1]);
+            return kind && value && value === text(attempt.fields[kind]);
+        });
+    }
+
     function correlatedAttempt(request) {
         var now = Date.now();
         if (!requestMatchesRules(request.url)) { return null; }
+        var wordpressAdminAjax = isWordPressAdminAjaxRequest(request);
         var candidates = recentAttempts.filter(function (attempt) {
             return !attempt.completed && now - attempt.createdAt <= SIGNAL_WINDOW_MS;
         }).map(function (attempt) {
             var actionMatch = sameUrl(attempt.action, request.url);
             var bodyMatch = bodyContainsAttempt(request.body, attempt);
             var patternMatch = config && config.rules && config.rules.requestUrlPatterns.length > 0;
+            if (wordpressAdminAjax) {
+                var wordpressBodyMatch = wordpressAdminAjaxBodyMatchesAttempt(request.body, attempt);
+                if (!wordpressBodyMatch) { return null; }
+                return { attempt: attempt, score: 12 + (attempt.method === request.method ? 1 : 0) };
+            }
             if (!actionMatch && !bodyMatch && !patternMatch) { return null; }
             var score = (bodyMatch ? 8 : 0) + (actionMatch ? 6 : 0) + (patternMatch ? 3 : 0) +
                 (attempt.method === request.method ? 1 : 0);
@@ -565,6 +605,22 @@
         } catch (_) { return Promise.resolve(false); }
     }
 
+    function wordpressAdminAjaxResponseIsSuccess(response) {
+        if (!response || !response.ok || typeof response.clone !== 'function') {
+            return Promise.resolve(false);
+        }
+        try {
+            return response.clone().json().then(function (body) {
+                return !!body && typeof body === 'object' && body.success === true;
+            }).catch(function () { return false; });
+        } catch (_) { return Promise.resolve(false); }
+    }
+
+    function requestResponseIsSuccess(request, response) {
+        return isWordPressAdminAjaxRequest(request) ?
+            wordpressAdminAjaxResponseIsSuccess(response) : responseIsSuccess(response);
+    }
+
     function fetchRequestInfo(input, init) {
         var request = input && typeof input === 'object' ? input : {};
         return {
@@ -584,7 +640,7 @@
             Promise.resolve(result).then(function (response) {
                 var attempt = correlatedAttempt(request);
                 if (!attempt) { return; }
-                responseIsSuccess(response).then(function (positive) {
+                requestResponseIsSuccess(request, response).then(function (positive) {
                     if (positive) { completedAttempt(attempt, 'fetch'); }
                 }).catch(function () { /* instrumentation never affects the host */ });
             }).catch(function () { /* original rejection remains untouched */ });
@@ -599,6 +655,15 @@
             var status = text(body && body.status);
             var nested = body && body.data && typeof body.data === 'object' ? body.data : {};
             return !!body && (body.success === true || nested.success === true || (status && status.toLowerCase() === 'success'));
+        } catch (_) { return false; }
+    }
+
+    function xhrRequestIsSuccess(request, xhr) {
+        if (!isWordPressAdminAjaxRequest(request)) { return xhrIsSuccess(xhr); }
+        if (!xhr || xhr.status < 200 || xhr.status >= 300) { return false; }
+        try {
+            var body = xhr.responseType === 'json' ? xhr.response : JSON.parse(xhr.responseText || '');
+            return !!body && typeof body === 'object' && body.success === true;
         } catch (_) { return false; }
     }
 
@@ -622,8 +687,9 @@
                 if (typeof xhr.addEventListener === 'function') {
                     xhr.addEventListener('loadend', function () {
                         try {
-                            var attempt = correlatedAttempt({ url: record.url, method: record.method, body: record.body });
-                            if (attempt && xhrIsSuccess(xhr)) { completedAttempt(attempt, 'xhr'); }
+                            var request = { url: record.url, method: record.method, body: record.body };
+                            var attempt = correlatedAttempt(request);
+                            if (attempt && xhrRequestIsSuccess(request, xhr)) { completedAttempt(attempt, 'xhr'); }
                         } catch (_) { /* instrumentation never affects the host */ }
                     });
                 }
@@ -754,7 +820,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.2.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.3.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

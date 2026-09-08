@@ -8,9 +8,11 @@
     var config = null;
     var attemptIds = new Map();
     var formAttempts = new WeakMap();
+    var submitEventAttempts = new WeakMap();
     var observedForms = new WeakSet();
     var recentAttempts = [];
     var autoInstalled = false;
+    var submitCaptureInstalled = false;
     var fetchInstalled = false;
     var xhrInstalled = false;
     var domObserver = null;
@@ -432,12 +434,38 @@
         try { return !form || typeof form.checkValidity !== 'function' || form.checkValidity(); } catch (_) { return false; }
     }
 
+    function ensureSubmitAttempt(form, submitter, event) {
+        if (!isEligibleForm(form) || !isValidForm(form)) {
+            return null;
+        }
+        if (event && typeof event === 'object') {
+            var eventAttempt = submitEventAttempts.get(event);
+            if (eventAttempt && eventAttempt.form === form) {
+                return eventAttempt;
+            }
+        }
+        var attempt = createAttempt(form, submitter);
+        if (event && typeof event === 'object') {
+            submitEventAttempts.set(event, attempt);
+        }
+        return attempt;
+    }
+
     function onSubmit(event) {
         var form = event && (event.currentTarget || event.target);
-        if (!isEligibleForm(form) || !isValidForm(form)) {
+        ensureSubmitAttempt(form, event && event.submitter || null, event);
+    }
+
+    function onWindowSubmit(event) {
+        ensureSubmitAttempt(event && event.target, event && event.submitter || null, event);
+    }
+
+    function installSubmitCapture() {
+        if (submitCaptureInstalled || !global || typeof global.addEventListener !== 'function') {
             return;
         }
-        createAttempt(form, event.submitter || null);
+        global.addEventListener('submit', onWindowSubmit, true);
+        submitCaptureInstalled = true;
     }
 
     function observeForm(form) {
@@ -795,6 +823,7 @@
     function installAutoCapture() {
         if (autoInstalled || !document) { return; }
         autoInstalled = true;
+        installSubmitCapture();
         discoverForms(document);
         if (typeof document.addEventListener === 'function') {
             document.addEventListener('DOMContentLoaded', function () {
@@ -820,7 +849,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.3.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.3.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

@@ -19,7 +19,9 @@
     var jqueryBridgeInstalled = false;
     var jqueryBridgeRetries = 0;
     var jqueryBridgeRetryPending = false;
-    var navigationRecoveryPromises = new Map();
+    // One source_lead_id is allowed to have only one active Browser API delivery.
+    // The map is shared by AJAX and navigation recovery paths.
+    var activeDeliveryPromises = new Map();
     var ATTEMPT_TTL_MS = 5 * 60 * 1000;
     var SIGNAL_WINDOW_MS = 30 * 1000;
     var NAVIGATION_STORAGE_LIMIT = 5;
@@ -215,12 +217,15 @@
     }
 
     function emptyNavigationRegistry() {
-        return { pending: [], delivered: [] };
+        return { pending: [], delivering: [], delivered: [] };
     }
 
     function pruneNavigationRegistry(value, now) {
         var registry = value && typeof value === 'object' ? value : emptyNavigationRegistry();
         var pending = Array.isArray(registry.pending) ? registry.pending.map(safeNavigationSnapshot).filter(function (item) {
+            return item && now - item.createdAt >= 0 && now - item.createdAt < ATTEMPT_TTL_MS;
+        }) : [];
+        var delivering = Array.isArray(registry.delivering) ? registry.delivering.map(safeNavigationSnapshot).filter(function (item) {
             return item && now - item.createdAt >= 0 && now - item.createdAt < ATTEMPT_TTL_MS;
         }) : [];
         var delivered = Array.isArray(registry.delivered) ? registry.delivered.filter(function (item) {
@@ -231,6 +236,7 @@
         }) : [];
         return {
             pending: pending.slice(-NAVIGATION_STORAGE_LIMIT),
+            delivering: delivering.slice(-NAVIGATION_STORAGE_LIMIT),
             delivered: delivered.slice(-NAVIGATION_STORAGE_LIMIT),
         };
     }
@@ -267,17 +273,42 @@
         });
         if (!snapshot) { return; }
         registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== snapshot.sourceLeadId; });
+        registry.delivering = registry.delivering.filter(function (item) { return item.sourceLeadId !== snapshot.sourceLeadId; });
+        registry.delivered = registry.delivered.filter(function (item) { return item.sourceLeadId !== snapshot.sourceLeadId; });
         registry.pending.push(snapshot);
         writeNavigationRegistry(registry);
     }
 
-    function forgetNavigationAttempt(sourceLeadId, delivered) {
+    function beginNavigationDelivery(sourceLeadId) {
+        var registry = readNavigationRegistry();
+        if (!sourceLeadId) { return false; }
+        // sessionStorage is optional; inability to persist recovery state must never
+        // prevent the normal AJAX delivery path.
+        if (!registry) { return true; }
+        var snapshot = registry.pending.filter(function (item) { return item.sourceLeadId === sourceLeadId; })[0];
+        if (registry.delivering.some(function (item) { return item.sourceLeadId === sourceLeadId; })) {
+            return false;
+        }
+        if (!snapshot) { return true; }
+        registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
+        registry.delivering = registry.delivering.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
+        registry.delivering.push(snapshot);
+        writeNavigationRegistry(registry);
+        return true;
+    }
+
+    function settleNavigationDelivery(sourceLeadId, delivered) {
         var registry = readNavigationRegistry();
         if (!registry || !sourceLeadId) { return; }
+        var snapshot = registry.delivering.filter(function (item) { return item.sourceLeadId === sourceLeadId; })[0] ||
+            registry.pending.filter(function (item) { return item.sourceLeadId === sourceLeadId; })[0];
         registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
+        registry.delivering = registry.delivering.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
         if (delivered) {
             registry.delivered = registry.delivered.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
             registry.delivered.push({ sourceLeadId: sourceLeadId, deliveredAt: Date.now() });
+        } else if (snapshot) {
+            registry.pending.push(snapshot);
         }
         writeNavigationRegistry(registry);
     }
@@ -532,7 +563,7 @@
             pageUrl: global.location && global.location.href, pageTitle: document && document.title,
             referrer: document && document.referrer, clientId: cookie('_ym_uid'), yclid: queryValue('yclid'), utm: {},
             action: formAction(form), method: formMethod(form), submitter: submitter || null,
-            completed: false, deliveryPromise: null,
+            completed: false, deliveryState: 'pending', deliveryPromise: null,
         };
         UTM_FIELDS.forEach(function (field) { attempt.utm[field] = queryValue(field); });
         formAttempts.set(form, attempt);
@@ -606,13 +637,23 @@
     }
 
     function completedAttempt(attempt, source) {
-        if (!attempt || attempt.completed || Date.now() - attempt.createdAt > ATTEMPT_TTL_MS) {
+        if (!attempt || attempt.completed || attempt.deliveryState === 'delivered' || Date.now() - attempt.createdAt > ATTEMPT_TTL_MS) {
             return Promise.resolve({ sent: false, reason: 'already_completed' });
         }
-        if (attempt.deliveryPromise) {
+        if (attempt.deliveryState === 'delivering' && attempt.deliveryPromise) {
             return attempt.deliveryPromise;
         }
-        attempt.deliveryPromise = send({
+        var active = activeDeliveryPromises.get(attempt.id);
+        if (active) {
+            attempt.deliveryState = 'delivering';
+            attempt.deliveryPromise = active;
+            return active;
+        }
+        if (!beginNavigationDelivery(attempt.id)) {
+            return Promise.resolve({ sent: false, reason: 'delivery_in_progress' });
+        }
+        attempt.deliveryState = 'delivering';
+        var delivery = send({
             sourceLeadId: attempt.id, createdAt: attempt.createdAtIso, name: attempt.fields.name,
             phone: attempt.fields.phone, email: attempt.fields.email, message: attempt.fields.message,
             address: attempt.fields.address, company: attempt.fields.company, service: attempt.fields.service,
@@ -623,15 +664,26 @@
             attempt.deliveryPromise = null;
             if (result && result.sent === true) {
                 attempt.completed = true;
-                forgetNavigationAttempt(attempt.id, true);
+                attempt.deliveryState = 'delivered';
+                settleNavigationDelivery(attempt.id, true);
+            } else {
+                attempt.deliveryState = 'pending';
+                settleNavigationDelivery(attempt.id, false);
             }
             debug('Lead Collector success signal:', source, result.sent ? 'sent' : result.reason);
             return result;
         }, function () {
             attempt.deliveryPromise = null;
+            attempt.deliveryState = 'pending';
+            settleNavigationDelivery(attempt.id, false);
             return { sent: false, reason: 'unavailable' };
+        }).then(function (result) {
+            activeDeliveryPromises.delete(attempt.id);
+            return result;
         });
-        return attempt.deliveryPromise;
+        attempt.deliveryPromise = delivery;
+        activeDeliveryPromises.set(attempt.id, delivery);
+        return delivery;
     }
 
     function markerInText(value, markers) {
@@ -689,20 +741,23 @@
             return right.createdAt - left.createdAt;
         }).slice(0, 1);
         candidates.forEach(function (snapshot) {
-            if (navigationRecoveryPromises.has(snapshot.sourceLeadId)) { return; }
+            if (activeDeliveryPromises.has(snapshot.sourceLeadId) || !beginNavigationDelivery(snapshot.sourceLeadId)) { return; }
             var delivery = send(snapshot).then(function (result) {
                 if (result && result.sent === true) {
-                    forgetNavigationAttempt(snapshot.sourceLeadId, true);
+                    settleNavigationDelivery(snapshot.sourceLeadId, true);
+                } else {
+                    settleNavigationDelivery(snapshot.sourceLeadId, false);
                 }
                 debug('Lead Collector navigation success signal:', result && result.sent ? 'sent' : result && result.reason);
                 return result;
             }, function () {
+                settleNavigationDelivery(snapshot.sourceLeadId, false);
                 return { sent: false, reason: 'unavailable' };
             }).then(function (result) {
-                navigationRecoveryPromises.delete(snapshot.sourceLeadId);
+                activeDeliveryPromises.delete(snapshot.sourceLeadId);
                 return result;
             });
-            navigationRecoveryPromises.set(snapshot.sourceLeadId, delivery);
+            activeDeliveryPromises.set(snapshot.sourceLeadId, delivery);
         });
     }
 
@@ -1046,7 +1101,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.4.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.4.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

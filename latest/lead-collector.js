@@ -19,8 +19,11 @@
     var jqueryBridgeInstalled = false;
     var jqueryBridgeRetries = 0;
     var jqueryBridgeRetryPending = false;
+    var navigationRecoveryPromises = new Map();
     var ATTEMPT_TTL_MS = 5 * 60 * 1000;
     var SIGNAL_WINDOW_MS = 30 * 1000;
+    var NAVIGATION_STORAGE_LIMIT = 5;
+    var NAVIGATION_STORAGE_PREFIX = 'lead-collector:navigation-attempts:v1:';
     var REQUIRED_CONFIG = ['projectId', 'endpoint', 'publicKey'];
     var UTM_FIELDS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
     var FIELD_ALIASES = {
@@ -38,6 +41,9 @@
         '.wpcf7-mail-sent-ok', '.elementor-message-success', '.w-form-done',
         '.t-form__successbox', '.form-success', '[data-form-success]'
     ];
+    var POSITIVE_URL_MARKERS = ['success', 'sent', 'submitted', 'thank-you', 'thankyou'];
+    var FAILURE_URL_MARKERS = ['error', 'failed', 'failure', 'invalid', 'rejected'];
+    var SUCCESS_QUERY_KEYS = ['lead', 'status', 'result', 'submission', 'form'];
 
     function isNgrokFreeEndpoint(endpoint) {
         try {
@@ -164,6 +170,116 @@
         var prefix = encodeURIComponent(name) + '=';
         var found = document.cookie.split('; ').find(function (item) { return item.indexOf(prefix) === 0; });
         return found ? text(decodeURIComponent(found.slice(prefix.length))) : undefined;
+    }
+
+    function navigationStorageKey() {
+        if (!config) { return null; }
+        return NAVIGATION_STORAGE_PREFIX + encodeURIComponent(config.projectId);
+    }
+
+    function navigationStorage() {
+        try {
+            return global && global.sessionStorage && typeof global.sessionStorage.getItem === 'function' &&
+                typeof global.sessionStorage.setItem === 'function' ? global.sessionStorage : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function safeNavigationSnapshot(value) {
+        if (!value || typeof value !== 'object') { return null; }
+        var createdAt = Number(value.createdAt);
+        var sourceLeadId = text(value.sourceLeadId) || text(value.source_lead_id) || text(value.id);
+        if (!sourceLeadId || !isFinite(createdAt) || createdAt <= 0) { return null; }
+        var fields = value.fields && typeof value.fields === 'object' ? value.fields : value;
+        var snapshot = {
+            sourceLeadId: sourceLeadId,
+            createdAt: createdAt,
+            createdAtIso: text(value.createdAtIso),
+            name: text(fields.name), phone: text(fields.phone), email: text(fields.email), message: text(fields.message),
+            address: text(fields.address), company: text(fields.company), service: text(fields.service),
+            pageUrl: text(value.pageUrl), pageTitle: text(value.pageTitle), referrer: text(value.referrer),
+            clientId: text(value.clientId), yclid: text(value.yclid),
+            consent: typeof fields.consent === 'boolean' ? fields.consent : undefined,
+            utm: {},
+        };
+        var rawUtm = value.utm && typeof value.utm === 'object' ? value.utm : {};
+        UTM_FIELDS.forEach(function (field) {
+            var item = text(rawUtm[field]);
+            if (item) { snapshot.utm[field] = item; }
+        });
+        Object.keys(snapshot).forEach(function (key) {
+            if (snapshot[key] === undefined) { delete snapshot[key]; }
+        });
+        return snapshot;
+    }
+
+    function emptyNavigationRegistry() {
+        return { pending: [], delivered: [] };
+    }
+
+    function pruneNavigationRegistry(value, now) {
+        var registry = value && typeof value === 'object' ? value : emptyNavigationRegistry();
+        var pending = Array.isArray(registry.pending) ? registry.pending.map(safeNavigationSnapshot).filter(function (item) {
+            return item && now - item.createdAt >= 0 && now - item.createdAt < ATTEMPT_TTL_MS;
+        }) : [];
+        var delivered = Array.isArray(registry.delivered) ? registry.delivered.filter(function (item) {
+            return item && typeof item === 'object' && text(item.sourceLeadId) && isFinite(Number(item.deliveredAt)) &&
+                now - Number(item.deliveredAt) >= 0 && now - Number(item.deliveredAt) < ATTEMPT_TTL_MS;
+        }).map(function (item) {
+            return { sourceLeadId: text(item.sourceLeadId), deliveredAt: Number(item.deliveredAt) };
+        }) : [];
+        return {
+            pending: pending.slice(-NAVIGATION_STORAGE_LIMIT),
+            delivered: delivered.slice(-NAVIGATION_STORAGE_LIMIT),
+        };
+    }
+
+    function readNavigationRegistry() {
+        var storage = navigationStorage();
+        var key = navigationStorageKey();
+        if (!storage || !key) { return null; }
+        try {
+            var raw = storage.getItem(key);
+            var parsed = raw ? JSON.parse(raw) : emptyNavigationRegistry();
+            return pruneNavigationRegistry(parsed, Date.now());
+        } catch (_) {
+            return emptyNavigationRegistry();
+        }
+    }
+
+    function writeNavigationRegistry(registry) {
+        var storage = navigationStorage();
+        var key = navigationStorageKey();
+        if (!storage || !key || !registry) { return; }
+        try {
+            storage.setItem(key, JSON.stringify(pruneNavigationRegistry(registry, Date.now())));
+        } catch (_) { /* storage is an optional resilience aid */ }
+    }
+
+    function persistNavigationAttempt(attempt) {
+        var registry = readNavigationRegistry();
+        if (!registry || !attempt) { return; }
+        var snapshot = safeNavigationSnapshot({
+            sourceLeadId: attempt.id, createdAt: attempt.createdAt, createdAtIso: attempt.createdAtIso,
+            fields: attempt.fields, pageUrl: attempt.pageUrl, pageTitle: attempt.pageTitle, referrer: attempt.referrer,
+            clientId: attempt.clientId, yclid: attempt.yclid, utm: attempt.utm,
+        });
+        if (!snapshot) { return; }
+        registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== snapshot.sourceLeadId; });
+        registry.pending.push(snapshot);
+        writeNavigationRegistry(registry);
+    }
+
+    function forgetNavigationAttempt(sourceLeadId, delivered) {
+        var registry = readNavigationRegistry();
+        if (!registry || !sourceLeadId) { return; }
+        registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
+        if (delivered) {
+            registry.delivered = registry.delivered.filter(function (item) { return item.sourceLeadId !== sourceLeadId; });
+            registry.delivered.push({ sourceLeadId: sourceLeadId, deliveredAt: Date.now() });
+        }
+        writeNavigationRegistry(registry);
     }
 
     function clientId() {
@@ -413,12 +529,15 @@
         var fields = extractFields(form);
         var attempt = {
             id: randomId(), form: form, createdAt: now, createdAtIso: new Date().toISOString(), fields: fields,
-            pageUrl: global.location && global.location.href, referrer: document && document.referrer,
+            pageUrl: global.location && global.location.href, pageTitle: document && document.title,
+            referrer: document && document.referrer, clientId: cookie('_ym_uid'), yclid: queryValue('yclid'), utm: {},
             action: formAction(form), method: formMethod(form), submitter: submitter || null,
             completed: false, deliveryPromise: null,
         };
+        UTM_FIELDS.forEach(function (field) { attempt.utm[field] = queryValue(field); });
         formAttempts.set(form, attempt);
         recentAttempts.push(attempt);
+        persistNavigationAttempt(attempt);
         return attempt;
     }
 
@@ -498,11 +617,13 @@
             phone: attempt.fields.phone, email: attempt.fields.email, message: attempt.fields.message,
             address: attempt.fields.address, company: attempt.fields.company, service: attempt.fields.service,
             consent: attempt.fields.consent,
-            pageUrl: attempt.pageUrl, referrer: attempt.referrer,
+            pageUrl: attempt.pageUrl, pageTitle: attempt.pageTitle, referrer: attempt.referrer,
+            clientId: attempt.clientId, yclid: attempt.yclid, utm: attempt.utm,
         }).then(function (result) {
             attempt.deliveryPromise = null;
             if (result && result.sent === true) {
                 attempt.completed = true;
+                forgetNavigationAttempt(attempt.id, true);
             }
             debug('Lead Collector success signal:', source, result.sent ? 'sent' : result.reason);
             return result;
@@ -511,6 +632,78 @@
             return { sent: false, reason: 'unavailable' };
         });
         return attempt.deliveryPromise;
+    }
+
+    function markerInText(value, markers) {
+        var normalized = String(value || '').toLowerCase();
+        return markers.some(function (marker) {
+            return normalized.split(/[^a-z0-9-]+/).some(function (token) { return token === marker; });
+        });
+    }
+
+    function navigationUrlSignals() {
+        try {
+            var url = new URL(global.location && global.location.href);
+            var positive = markerInText(url.pathname, POSITIVE_URL_MARKERS) || markerInText(url.hash, POSITIVE_URL_MARKERS);
+            var failure = markerInText(url.pathname, FAILURE_URL_MARKERS) || markerInText(url.hash, FAILURE_URL_MARKERS);
+            url.searchParams.forEach(function (rawValue, rawKey) {
+                var key = String(rawKey || '').toLowerCase();
+                var value = String(rawValue || '').toLowerCase();
+                if (SUCCESS_QUERY_KEYS.indexOf(key) >= 0 && POSITIVE_URL_MARKERS.indexOf(value) >= 0) {
+                    positive = true;
+                }
+                if (key === 'success' && (value === '' || value === '1' || value === 'true' || value === 'yes')) {
+                    positive = true;
+                }
+                if (['error', 'failed', 'failure', 'invalid', 'rejected'].indexOf(key) >= 0 ||
+                    (SUCCESS_QUERY_KEYS.indexOf(key) >= 0 && FAILURE_URL_MARKERS.indexOf(value) >= 0)) {
+                    failure = true;
+                }
+            });
+            return { positive: positive, failure: failure };
+        } catch (_) {
+            return { positive: false, failure: false };
+        }
+    }
+
+    function hasDocumentSuccessSignal() {
+        if (!document || !config) { return false; }
+        var selectors = DEFAULT_SUCCESS_SELECTORS.concat(config.rules.successSelectors);
+        if (matchesAny(document, selectors)) { return true; }
+        if (typeof document.querySelectorAll !== 'function') { return false; }
+        return selectors.some(function (selector) {
+            try { return document.querySelectorAll(selector).length > 0; } catch (_) { return false; }
+        });
+    }
+
+    function recoverNavigationAttempts() {
+        if (!config) { return; }
+        var signals = navigationUrlSignals();
+        if (signals.failure || (!signals.positive && !hasDocumentSuccessSignal())) { return; }
+        var registry = readNavigationRegistry();
+        if (!registry) { return; }
+        writeNavigationRegistry(registry);
+        var candidates = registry.pending.filter(function (snapshot) {
+            return !registry.delivered.some(function (item) { return item.sourceLeadId === snapshot.sourceLeadId; });
+        }).sort(function (left, right) {
+            return right.createdAt - left.createdAt;
+        }).slice(0, 1);
+        candidates.forEach(function (snapshot) {
+            if (navigationRecoveryPromises.has(snapshot.sourceLeadId)) { return; }
+            var delivery = send(snapshot).then(function (result) {
+                if (result && result.sent === true) {
+                    forgetNavigationAttempt(snapshot.sourceLeadId, true);
+                }
+                debug('Lead Collector navigation success signal:', result && result.sent ? 'sent' : result && result.reason);
+                return result;
+            }, function () {
+                return { sent: false, reason: 'unavailable' };
+            }).then(function (result) {
+                navigationRecoveryPromises.delete(snapshot.sourceLeadId);
+                return result;
+            });
+            navigationRecoveryPromises.set(snapshot.sourceLeadId, delivery);
+        });
     }
 
     function success(formOrPayload) {
@@ -765,8 +958,10 @@
                                 });
                             }
                         });
+                        recoverNavigationAttempts();
                     } else if (mutation.type === 'attributes') {
                         domSuccessSignal(mutation.target);
+                        recoverNavigationAttempts();
                     }
                 });
             });
@@ -825,9 +1020,11 @@
         autoInstalled = true;
         installSubmitCapture();
         discoverForms(document);
+        recoverNavigationAttempts();
         if (typeof document.addEventListener === 'function') {
             document.addEventListener('DOMContentLoaded', function () {
                 discoverForms(document);
+                recoverNavigationAttempts();
                 if (!installJQueryElementorBridge()) { scheduleJQueryElementorBridge(); }
             });
         }
@@ -849,7 +1046,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.3.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.4.0', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

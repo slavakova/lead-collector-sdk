@@ -8,12 +8,12 @@ hand:
 python scripts/build_lead_collector_sdk.py
 ```
 
-SDK version: `1.3.1`.
+SDK version: `1.4.0`.
 
 ```text
 lead-collector-sdk/
   lead-collector.js
-  v1.3.1/lead-collector.js
+  v1.4.0/lead-collector.js
   latest/lead-collector.js
   README.md
 ```
@@ -22,7 +22,7 @@ Publish this directory alone to a small public repository. A production site
 should use an immutable URL, for example:
 
 ```text
-https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.3.1/lead-collector.js
+https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.4.0/lead-collector.js
 ```
 
 ## Install
@@ -48,6 +48,12 @@ be detected safely, add this one line to its existing confirmed callback:
 ```js
 LeadCollector.success(form);
 ```
+
+For native form redirects/reloads, version 1.4.0 retains a five-minute,
+session-scoped pending snapshot containing only safe semantic fields and page
+context. It recovers that same source lead ID only after an explicit success
+URL marker or a known success UI marker; normal reloads, failure URLs, direct
+success-page visits, and already delivered attempts do not send a lead.
 
 `LeadCollector.send(payload)` remains available for existing explicit SDK
 1.0.x integrations. See `docs/LEAD_COLLECTOR.md` in the source project for

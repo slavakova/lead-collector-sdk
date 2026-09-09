@@ -8,12 +8,12 @@ hand:
 python scripts/build_lead_collector_sdk.py
 ```
 
-SDK version: `1.4.2`.
+SDK version: `1.4.3`.
 
 ```text
 lead-collector-sdk/
   lead-collector.js
-  v1.4.2/lead-collector.js
+  v1.4.3/lead-collector.js
   latest/lead-collector.js
   README.md
 ```
@@ -22,7 +22,7 @@ Publish this directory alone to a small public repository. A production site
 should use an immutable URL, for example:
 
 ```text
-https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.4.2/lead-collector.js
+https://cdn.jsdelivr.net/gh/GITHUB_USER/lead-collector-sdk@v1.4.3/lead-collector.js
 ```
 
 ## Install
@@ -49,7 +49,7 @@ be detected safely, add this one line to its existing confirmed callback:
 LeadCollector.success(form);
 ```
 
-For native form redirects/reloads, version 1.4.2 retains a five-minute,
+For native form redirects/reloads, version 1.4.3 retains a five-minute,
 session-scoped pending snapshot containing only safe semantic fields and page
 context. It recovers that same source lead ID only after an explicit success
 URL marker or a known success UI marker; normal reloads, failure URLs, direct

@@ -1067,9 +1067,23 @@
         return closest(target, 'form');
     }
 
+    function completedTildaAttempt(event) {
+        var form = formFromEvent(event);
+        if (!form) { return; }
+        var attempt = currentAttempt(form, false);
+        if (!attempt) {
+            // Tilda can confirm a form without dispatching a native submit event.
+            // Its aftersuccess event is the authoritative signal for a new attempt.
+            if (!isEligibleForm(form) || !isValidForm(form)) { return; }
+            attempt = createAttempt(form);
+        }
+        completedAttempt(attempt, 'tilda');
+    }
+
     function installPlatformProviders() {
         if (!document || typeof document.addEventListener !== 'function') { return; }
-        ['wpcf7mailsent', 'tildaform:aftersuccess', 'elementor:form:success', 'elementor:form:submit_success'].forEach(function (eventName) {
+        document.addEventListener('tildaform:aftersuccess', completedTildaAttempt);
+        ['wpcf7mailsent', 'elementor:form:success', 'elementor:form:submit_success'].forEach(function (eventName) {
             document.addEventListener(eventName, function (event) {
                 var form = formFromEvent(event);
                 if (form) { completedAttempt(currentAttempt(form, false), 'platform'); }
@@ -1136,7 +1150,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.4.2', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.4.3', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;

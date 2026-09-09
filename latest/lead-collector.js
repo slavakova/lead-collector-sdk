@@ -19,6 +19,7 @@
     var jqueryBridgeInstalled = false;
     var jqueryBridgeRetries = 0;
     var jqueryBridgeRetryPending = false;
+    var metrikaClientIdCache = null;
     // One source_lead_id is allowed to have only one active Browser API delivery.
     // The map is shared by AJAX and navigation recovery paths.
     var activeDeliveryPromises = new Map();
@@ -201,7 +202,10 @@
             name: text(fields.name), phone: text(fields.phone), email: text(fields.email), message: text(fields.message),
             address: text(fields.address), company: text(fields.company), service: text(fields.service),
             pageUrl: text(value.pageUrl), pageTitle: text(value.pageTitle), referrer: text(value.referrer),
-            clientId: text(value.clientId), yclid: text(value.yclid),
+            clientId: text(value.clientId),
+            clientIdSource: value.clientIdSource === 'metrika' || value.clientIdSource === 'cookie' ? value.clientIdSource : undefined,
+            clientIdCapturedAt: isFinite(Number(value.clientIdCapturedAt)) ? Number(value.clientIdCapturedAt) : undefined,
+            yclid: text(value.yclid),
             consent: typeof fields.consent === 'boolean' ? fields.consent : undefined,
             utm: {},
         };
@@ -269,7 +273,8 @@
         var snapshot = safeNavigationSnapshot({
             sourceLeadId: attempt.id, createdAt: attempt.createdAt, createdAtIso: attempt.createdAtIso,
             fields: attempt.fields, pageUrl: attempt.pageUrl, pageTitle: attempt.pageTitle, referrer: attempt.referrer,
-            clientId: attempt.clientId, yclid: attempt.yclid, utm: attempt.utm,
+            clientId: attempt.clientId, clientIdSource: attempt.clientIdSource, clientIdCapturedAt: attempt.clientIdCapturedAt,
+            yclid: attempt.yclid, utm: attempt.utm,
         });
         if (!snapshot) { return; }
         registry.pending = registry.pending.filter(function (item) { return item.sourceLeadId !== snapshot.sourceLeadId; });
@@ -313,8 +318,24 @@
         writeNavigationRegistry(registry);
     }
 
-    function clientId() {
-        var fallback = cookie('_ym_uid');
+    function cachedMetrikaClientId() {
+        return text(metrikaClientIdCache);
+    }
+
+    function knownClientId() {
+        return cachedMetrikaClientId() || cookie('_ym_uid');
+    }
+
+    function knownClientIdSource() {
+        return cachedMetrikaClientId() ? 'metrika' : (cookie('_ym_uid') ? 'cookie' : undefined);
+    }
+
+    function clientId(snapshotClientId) {
+        // With a configured counter, its API is canonical. A current browser
+        // cookie is only a fallback, and a persisted navigation value is last.
+        var fallback = config && config.metrikaCounterId ?
+            (cookie('_ym_uid') || text(snapshotClientId) || cachedMetrikaClientId()) :
+            (text(snapshotClientId) || cookie('_ym_uid') || cachedMetrikaClientId());
         if (!config.metrikaCounterId || typeof global.ym !== 'function') {
             return Promise.resolve(fallback);
         }
@@ -330,13 +351,21 @@
             try {
                 global.ym(config.metrikaCounterId, 'getClientID', function (value) {
                     global.clearTimeout(timer);
-                    complete(value);
+                    var current = text(value);
+                    if (current) { metrikaClientIdCache = current; }
+                    complete(current);
                 });
             } catch (_) {
                 global.clearTimeout(timer);
                 complete(fallback);
             }
         });
+    }
+
+    function primeMetrikaClientId() {
+        if (config && config.metrikaCounterId && typeof global.ym === 'function') {
+            clientId();
+        }
     }
 
     function buildPayload(value, resolvedClientId) {
@@ -349,7 +378,7 @@
             page_url: text(input.pageUrl) || (global.location && global.location.href),
             page_title: text(input.pageTitle) || text(document && document.title),
             referrer: text(input.referrer) || (document && document.referrer),
-            client_id: text(input.clientId) || resolvedClientId, yclid: text(input.yclid) || queryValue('yclid'),
+            client_id: text(resolvedClientId) || text(input.clientId), yclid: text(input.yclid) || queryValue('yclid'),
             consent: typeof input.consent === 'boolean' ? input.consent : undefined,
         };
         UTM_FIELDS.forEach(function (field) {
@@ -364,11 +393,16 @@
     }
 
     function init(value) {
+        var previousCounterId = config && config.metrikaCounterId;
         config = normalizeConfig(value);
         if (!config) {
             debug('Lead Collector configuration is invalid.');
             return false;
         }
+        if (previousCounterId !== config.metrikaCounterId) {
+            metrikaClientIdCache = null;
+        }
+        primeMetrikaClientId();
         if (config.auto) {
             installAutoCapture();
         }
@@ -379,7 +413,7 @@
         if (!config) {
             return Promise.resolve({ sent: false, reason: 'not_configured' });
         }
-        return clientId().then(function (resolvedClientId) {
+        return clientId(value && value.clientId).then(function (resolvedClientId) {
             var payload = buildPayload(value || {}, resolvedClientId);
             var url = config.endpoint + '/api/browser-leads/' + encodeURIComponent(config.projectId);
             var headers = { 'Content-Type': 'application/json', 'X-Lead-Collector-Public-Key': config.publicKey };
@@ -561,7 +595,8 @@
         var attempt = {
             id: randomId(), form: form, createdAt: now, createdAtIso: new Date().toISOString(), fields: fields,
             pageUrl: global.location && global.location.href, pageTitle: document && document.title,
-            referrer: document && document.referrer, clientId: cookie('_ym_uid'), yclid: queryValue('yclid'), utm: {},
+            referrer: document && document.referrer, clientId: knownClientId(), clientIdSource: knownClientIdSource(),
+            clientIdCapturedAt: now, yclid: queryValue('yclid'), utm: {},
             action: formAction(form), method: formMethod(form), submitter: submitter || null,
             completed: false, deliveryState: 'pending', deliveryPromise: null,
         };
@@ -1101,7 +1136,7 @@
     }
 
     global.LeadCollector = Object.freeze({
-        version: '1.4.1', init: init, send: send, success: success, registerAdapter: registerAdapter,
+        version: '1.4.2', init: init, send: send, success: success, registerAdapter: registerAdapter,
     });
 
     var script = document && document.currentScript;
